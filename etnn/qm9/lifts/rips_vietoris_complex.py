@@ -1,66 +1,127 @@
-from itertools import combinations
+# etnn/qm9/lifts/rips_vietoris_complex.py
 
+from itertools import combinations
+import torch
 import gudhi
 from torch_geometric.data import Data
 
 from etnn.combinatorial_data import Cell
 
+# Number of dummy features attached to each simplex
 NUM_FEATURES = 0
 
 
 def rips_lift(graph: Data, dim: int, dis: float, fc_nodes: bool = True) -> set[Cell]:
     """
-    Construct a Rips complex from a graph and returns its simplices.
+    Construct a Rips complex from a graph (with periodic boundary conditions)
+    and return its simplices as a set of Cells.
 
     Parameters
     ----------
-    graph : object
-        A graph object containing vertices 'x' and their positions 'pos'.
+    graph : Data
+        A PyG Data object containing:
+          - x:         node feature tensor [N×F]
+          - frac_pos:  fractional node coords [N×3] in [0,1)^3
+          - lattice:   3×3 cell basis matrix
     dim : int
-        Maximum dimension of simplices in the Rips complex.
+        Maximum simplex dimension (i.e. build up to dim‐simplices).
     dis : float
-        Maximum distance between any two points in a simplex.
+        Cutoff distance (in the same units as lattice·frac_pos).
     fc_nodes : bool, optional
-        If True, force inclusion of all edges as 1-dimensional simplices. Default is True.
+        If True, ensure every 1‐simplex between node pairs is included.
 
     Returns
     -------
     set[Cell]
-        A set of Cells, where each Cell represents a simplex in the Rips complex. Each simplex is a
-        frozenset of vertex indices accompanied by a 0-dimensional feature vector.
-
-    Attributes
-    ----------
-    num_features : int
-        The number of features for each node.
-
-    Notes
-    -----
-    The function uses the `gudhi` library to construct the Rips complex. It first converts the graph
-    positions to a list of points, then generates the Rips complex and its simplex tree up to the
-    specified dimension and edge length. Optionally, it includes all nodes as 0-dimensional
-    simplices. Finally, it extracts and returns the simplices from the simplex tree.
+        A set of Cells, where each Cell is (frozenset(node_indices), feature_tuple).
     """
-    # create simplicial complex
-    x_0, pos = graph.x, graph.pos
-    points = [pos[i].tolist() for i in range(pos.shape[0])]
-    rips_complex = gudhi.RipsComplex(points=points, max_edge_length=dis)
-    simplex_tree = rips_complex.create_simplex_tree(max_dimension=dim)
+    # Unpack graph attributes
+    x_0      = graph.x
+    pos_frac = graph.frac_pos    # [N, 3]
+    lattice  = graph.lattice     # [3, 3]
 
+    # ——— PBC neighbor‐listing (matching vendored signature) ———
+    # 1) Cartesian coords from fractional
+    cart_coords = pos_frac @ lattice.T                 # [N×3]
+
+    # 2) Cell lengths & angles
+    a, b, c = lattice[:, 0], lattice[:, 1], lattice[:, 2]
+    lengths = torch.stack([a.norm(), b.norm(), c.norm()])  # [3]
+    alpha = torch.acos((b @ c) / (b.norm() * c.norm()))
+    beta  = torch.acos((a @ c) / (a.norm() * c.norm()))
+    gamma = torch.acos((a @ b) / (a.norm() * b.norm()))
+    angles = torch.stack([alpha, beta, gamma])            # [3]
+
+    # 3) Call vendored PBC routine
+    num_atoms = torch.tensor([cart_coords.size(0)],
+                         dtype=torch.long,
+                         device=cart_coords.device)
+    device    = cart_coords.device
+        # ——— PBC neighbor‐listing (manual, minimal) ———
+    N = pos_frac.size(0)
+    edge_list = []
+    dist_list = []
+    offset_list = []
+
+    # for every unordered pair i<j compute the wrapped distance
+    for i in range(N):
+        for j in range(i+1, N):
+            df = pos_frac[j] - pos_frac[i]                           # Δ frac
+            df_wrap = df - torch.round(df)                           # minimum‐image frac
+            dc = (df_wrap @ lattice.T)                               # back to Cartesian
+            d = dc.norm().item()
+            if d <= dis:
+                # record both directions
+                off = (-torch.round(df)).long()                     # offset so frac+off=df_wrap
+                edge_list += [[i, j], [j, i]]
+                dist_list += [d, d]
+                offset_list += [off.tolist(), (-off).tolist()]
+
+    # pack into tensors (or empty tensors if no edges)
+    if edge_list:
+        edge_index  = torch.tensor(edge_list, dtype=torch.long).t().contiguous()  # [2×E]
+        distances   = torch.tensor(dist_list,  dtype=torch.float)                # [E]
+        cell_offsets= torch.tensor(offset_list, dtype=torch.long)                # [E×3]
+    else:
+        edge_index   = torch.empty((2, 0), dtype=torch.long)
+        distances    = torch.empty((0,),    dtype=torch.float)
+        cell_offsets = torch.empty((0, 3),  dtype=torch.long)
+    # ————————————————————————————————————————————————
+    # Build the simplex tree from these edges
+    simplex_tree = gudhi.SimplexTree()
+    # Insert all 0‐simplices (nodes)
+    for idx in range(x_0.size(0)):
+        simplex_tree.insert([idx])
+
+    # Insert 1‐simplices (PBC edges)
+    for (u, v), d in zip(edge_index.t().tolist(), distances.tolist()):
+        # We know d ≤ dis already
+        simplex_tree.insert([u, v])
+
+    # Optionally force‐connect every node pair as an edge
     if fc_nodes:
-        nodes = list(range(x_0.shape[0]))
-        for edge in combinations(nodes, 2):
-            simplex_tree.insert(edge)
+        nodes = list(range(x_0.size(0)))
+        for u, v in combinations(nodes, 2):
+            simplex_tree.insert([u, v])
 
-    # convert simplicial complex to set of frozensets
+    # At this point, you may wish to manually expand the tree
+    # to higher‐order cells (2‐simplices, 3‐simplices, …) up to `dim`,
+    # since we bypassed `RipsComplex.create_simplex_tree`. For example:
+    # simplex_tree.expand_to_dimension(dim)
+
+    # Convert to a set of frozensets (Cells)
     simplexes = set()
-    simplexes.update(frozenset(simplex) for simplex, _ in simplex_tree.get_simplices())
+    for simplex, _ in simplex_tree.get_simplices():
+        # GUDHI returns all simplices in the tree (0 up to the inserted max)
+        if len(simplex) - 1 <= dim:  # filter by dimension
+            simplexes.add(frozenset(simplex))
 
-    # add 0-dimensional feature vectors
+    # Attach dummy feature vectors to each simplex
     dummy_features = tuple(range(NUM_FEATURES))
-    simplexes = {(simplex, dummy_features) for simplex in simplexes}
+    simplexes = {(s, dummy_features) for s in simplexes}
 
     return simplexes
 
 
+# Tell the framework how many features this lifter produces per simplex
 rips_lift.num_features = NUM_FEATURES

@@ -359,7 +359,18 @@ class QM9CC(InMemoryDataset):
             conf = mol.GetConformer()
             pos = conf.GetPositions()
             pos = torch.tensor(pos, dtype=torch.float)
+            # ——— add lattice info for periodic boundary conditions ———
+            # For a molecular crystal, you’ll pass in your 3×3 cell vectors;
+            # here we just demonstrate the API. You can replace `A` with your real cell.
+            A = torch.eye(3)                                 # placeholder: replace with actual lattice
+            data.lattice = A                                 # [3×3] matrix of cell basis vectors
 
+            # Compute fractional coords f in [0,1)³:
+            #   f = A⁻¹·r  (mod 1)  
+            Ainv = torch.linalg.inv(A)
+            frac = (Ainv @ pos.t()).t()                      # [N×3]
+            data.frac_pos = frac.frac()                      # equivalent to frac % 1
+            # ————————————————————————————————————————————
             type_idx = []
             atomic_number = []
             aromatic = []
