@@ -5,152 +5,150 @@ import numpy as np
 import torch
 
 from etnn import utils
-
-
+from etnn.utils import scatter_mean, scatter_max
 def compute_invariants(
-    pos: torch.FloatTensor,
-    cell_ind: dict[str, torch.FloatTensor],
+    pos: torch.Tensor,
+    frac_pos: torch.Tensor,
+    lattice: torch.Tensor,
+    cell_ind: dict[str, list[list[int]]],
     adj: dict[str, torch.LongTensor],
     hausdorff: bool = True,
-    # inv_ind: dict[str, torch.FloatTensor],
-) -> dict[str, torch.FloatTensor]:
+) -> dict[str, torch.Tensor]:
     """
-    Compute geometric invariants between pairs of cells specified in `adj`.
-
-    This function calculates the following geometric features:
-
-    Distance between centroids
-        Euclidean distance between the centroids of cell pairs. The centroids are computed only once
-        per rank and memoized to improve efficiency. The distances serve as geometric invariants
-        that characterize the spatial relationships between cells of different ranks.
-
-    Maximum pairwise distance within-cell
-        For both the sender and receiver cell, the pairwise distances between their nodes are
-        computed and the maximum distance is stored. This feature is meant to very loosely
-        approximate the size of each cell.
-
-    Two Hausdorff distances
-        We compute two Hausdorff distances, one from the sender's point of view and one from the
-        receiver's. The Hausdorff distance between two sets of points is typically defined as
-
-            H(A, B) = max{sup_{a in A} inf_{b in B} d(a, b), sup_{b in B} inf_{a in A} d(b, a)}
-
-        where A and B are two sets of points, d(a, b) is the Euclidean distance between points a and
-        b, sup denotes the supremum (least upper bound) of a set, and inf denotes the infimum
-        (greatest lower bound) of a set. Instead of taking the maximum, we instead return both of
-        the terms. This choice allows us to implicitly encode the subset relationship into these
-        features: the first Hausdorff distance is 0 iff A is a subset of B and the second Hausdorff
-        distance is 0 iff B is a subset of A.
-
+    Compute PBC‐aware geometric invariants for each cell adjacency.
 
     Parameters
     ----------
-    pos : torch.FloatTensor
-        A 2D tensor of shape (num_nodes, num_dimensions) containing the positions of each node.
-    cell_ind : dict
-        A dictionary mapping cell ranks to tensors of shape (num_cells, max_cardinality) containing
-        indices of nodes for each cell. It is used to identify the cells for which centroids should
-        be computed.
-    adj : dict
-        A dictionary where each key is a string in the format 'sender_rank_receiver_rank' indicating
-        the ranks of cell pairs, and each value is a tensor of shape (2, num_cell_pairs) containing
-        indices for sender and receiver cells.
+    pos : torch.Tensor [N×3]
+        Cartesian node coordinates (unused for PBC, kept for compatibility).
+    frac_pos : torch.Tensor [N×3]
+        Fractional node coordinates in [0,1)^3.
+    lattice : torch.Tensor [3×3]
+        Cell basis matrix whose columns are the primitive vectors.
+    cell_ind : dict[str → list[list[int]]]
+        For each rank (e.g. "0","1",...), a list of cells, each cell given by its node‐indices.
+    adj : dict[str → LongTensor of shape 2×E]
+        Adjacency between cell ranks: keys like "0_1", values are two rows of sender/receiver cell indices.
     hausdorff : bool
-        Whether to compute the Hausdorff distances between cells. Default is True
+        If True, append a PBC Hausdorff distance feature.
 
     Returns
     -------
-    dict
-        A dictionary where each key corresponds to a key in `adj` and each value is a 2D tensor
-        holding the computed geometric features for each cell pair.
-
-    Notes
-    -----
-    The `inv_ind` and `device` parameters are included for compatibility with a previous function
-    interface and might be used in future versions of this function as it evolves. The computation
-    of cell centroids is memoized based on cell rank to avoid redundant calculations, enhancing
-    performance especially for large datasets with many cells. The current implementation focuses on
-    Euclidean distances but may be extended to include other types of geometric invariants.
+    features : dict[str → Tensor of shape E×F]
+        For each adjacency rank_pair, an (E×F) tensor of invariants:
+          F = 3 (centroid‐dist, sender‐diameter, receiver‐diameter) [+1 if hausdorff].
     """
-    new_features = {}
-    mean_cell_positions = {}
-    max_pairwise_distances = {}
+    device = frac_pos.device
+    # 1) Precompute centroids and diameters for each rank
+    centroids: dict[str, torch.Tensor] = {}
+    diameters: dict[str, torch.Tensor] = {}
+
+    for rank, cells in cell_ind.items():
+        # Flatten all node‐indices for this rank
+        ids, index = [], []
+        for i, cell_nodes in enumerate(cells):
+            ids.extend(cell_nodes)
+            index.extend([i] * len(cell_nodes))
+
+        if len(ids) == 0:
+            # No cells: empty tensors
+            centroids[rank] = frac_pos.new_empty((0, 3))
+            diameters[rank] = frac_pos.new_empty((0,))
+            continue
+
+        ids_tensor    = torch.tensor(ids,    dtype=torch.long, device=device)
+        index_tensor  = torch.tensor(index,  dtype=torch.long, device=device)
+
+        # 1a) Fractional centroids → Cartesian
+        frac_cent = scatter_mean(frac_pos[ids_tensor], index_tensor, dim=0,
+                                 dim_size=len(cells))        # [num_cells×3]
+        centroids[rank] = frac_cent @ lattice.T               # [num_cells×3]
+
+        # 1b) PBC‐aware diameters (max distance within each cell)
+        # Compute all pairwise distances within each cell
+        # We reuse the scatter_max on the flattened list of all pairs
+        pair_dists = []
+        pair_idx   = []
+        for i, cell_nodes in enumerate(cells):
+            for u in cell_nodes:
+                for v in cell_nodes:
+                    # minimum‐image in fractional space
+                    df = frac_pos[v] - frac_pos[u]
+                    df_wrap = df - torch.round(df)
+                    dc = df_wrap @ lattice.T
+                    pair_dists.append(dc.norm())
+                    pair_idx.append(i)
+        pair_dists_tensor = torch.stack(pair_dists)                       # [total_pairs]
+        pair_idx_tensor   = torch.tensor(pair_idx, dtype=torch.long,
+                                         device=device)                  # [total_pairs]
+        diameters[rank] = scatter_max(pair_dists_tensor, pair_idx_tensor,
+                                      dim=0, dim_size=len(cells))      # [num_cells]
+
+    # 2) Build per‐adjacency features
+    features: Dict[str, torch.Tensor] = {}
     for rank_pair, cell_pairs in adj.items():
+        send_rank, recv_rank = rank_pair.split("_")
+        send_idx = cell_pairs[0]  # shape [E]
+        recv_idx = cell_pairs[1]  # shape [E]
 
-        # Compute mean cell positions memoized
-        sender_rank, receiver_rank = rank_pair.split("_")[:2]
-        for rank in [sender_rank, receiver_rank]:
-            if rank not in mean_cell_positions:
-                mean_cell_positions[rank] = compute_centroids(cell_ind[rank], pos)
-            if rank not in max_pairwise_distances:
-                max_pairwise_distances[rank] = compute_max_pairwise_distances(
-                    cell_ind[rank], pos
-                )
+        # 2a) Centroid–centroid distance
+        cs = centroids[send_rank][send_idx]  # [E×3]
+        cr = centroids[recv_rank][recv_idx]  # [E×3]
+        centroid_dist = torch.norm(cs - cr, dim=1)  # [E]
 
-        # Compute mean distances
-        indexed_sender_centroids = mean_cell_positions[sender_rank][cell_pairs[0]]
-        indexed_receiver_centroids = mean_cell_positions[receiver_rank][cell_pairs[1]]
-        differences = indexed_sender_centroids - indexed_receiver_centroids
-        distances = torch.sqrt((differences**2).sum(dim=1, keepdim=True))
+        # 2b) Sender/receiver diameters
+        d_send = diameters[send_rank][send_idx]    # [E]
+        d_recv = diameters[recv_rank][recv_idx]    # [E]
 
-        # Retrieve maximum pairwise distances
-        max_dist_sender = max_pairwise_distances[sender_rank][cell_pairs[0]]
-        max_dist_receiver = max_pairwise_distances[receiver_rank][cell_pairs[1]]
+        # 2c) Stack into [E×3]
+        feats = torch.stack([centroid_dist, d_send, d_recv], dim=1)
 
-        # Compute Hausdorff distances
-        sender_cells = cell_ind[sender_rank][cell_pairs[0]]
-        receiver_cells = cell_ind[receiver_rank][cell_pairs[1]]
-
-        new_feats = torch.cat([distances, max_dist_sender, max_dist_receiver], dim=1)
-
+        # 2d) Optional Hausdorff distance under PBC
         if hausdorff:
-            hausdorff_distances = compute_hausdorff_distances(
-                sender_cells, receiver_cells, pos
-            )
-            new_feats = torch.cat([new_feats, hausdorff_distances], dim=1)
+            from etnn.invariants import compute_hausdorff_distances
+            # For each pair of cells, compute max_{u in S, v in R} ||u-v|| under PBC
+            haus_vals = []
+            for u_idx, v_idx in zip(send_idx.tolist(), recv_idx.tolist()):
+                S = cell_ind[send_rank][u_idx]
+                R = cell_ind[recv_rank][v_idx]
+                max_dist = 0.0
+                for u in S:
+                    for v in R:
+                        df = frac_pos[v] - frac_pos[u]
+                        df_wrap = df - torch.round(df)
+                        dc = df_wrap @ lattice.T
+                        max_dist = max(max_dist, dc.norm().item())
+                haus_vals.append(max_dist)
+            haus_tensor = torch.tensor(haus_vals, device=device).unsqueeze(1)  # [E×1]
+            feats = torch.cat([feats, haus_tensor], dim=1)                    # [E×4]
 
-        # Combine all features
-        new_features[rank_pair] = new_feats
+        features[rank_pair] = feats
 
-    return new_features
-
+    return features
 
 # compute_invariants.num_features_map = defaultdict(lambda: 5)  # not needed, better to compute dynamic
 
 
-def compute_max_pairwise_distances(
-    cells: torch.FloatTensor, pos: torch.FloatTensor
-) -> torch.FloatTensor:
+def compute_max_pairwise_distances(cells, pos):
     """
-    Compute the maximum pairwise distance between nodes within each cell.
+    Compute each cell’s diameter (max internal pairwise distance).
 
     Parameters
     ----------
-    cells : torch.FloatTensor
-        A 2D tensor of shape (n, k) containing indices of nodes for n cells. Indices may include
-        NaNs to denote missing values.
-    pos : torch.FloatTensor
-        A 2D tensor of shape (m, 3) representing the 3D positions of m nodes.
+    cells : list[list[int]]
+        Each inner list is the node‐indices for one cell.
+    pos : torch.Tensor, shape [N, D]
+        Cartesian coordinates of all N nodes.
 
     Returns
     -------
-    torch.FloatTensor
-        A tensor of shape (n, 1) containing the maximum pairwise distance within each of the n
-        cells.
-
-    Notes
-    -----
-    The function handles cells with varying numbers of nodes by using NaN values in the `cells`
-    tensor to indicate missing nodes. It computes pairwise distances only for valid (non-NaN) nodes
-    within each cell and ignores distances involving missing nodes.
+    torch.Tensor, shape [len(cells)]
+        diameter[i] = max_{u,v in cells[i]} ||pos[u] - pos[v]||
     """
-
-    dist_matrix = compute_intercell_distances(cells, cells, pos)
-    dist_matrix = dist_matrix.nan_to_num(float("-inf"))
-    max_distances = dist_matrix.max(dim=2)[0].max(dim=1)[0].unsqueeze(1)
-
-    return max_distances
-
+    # Use intercell‐distance routine with sender=receiver=cells
+    dist_mat = compute_intercell_distances(cells, cells, pos)
+    # The diameter of cell i is the (i,i) entry
+    return torch.diagonal(dist_mat)
 
 def compute_hausdorff_distances(
     sender_cells: torch.FloatTensor,
@@ -201,96 +199,90 @@ def compute_hausdorff_distances(
     return hausdorff_distances
 
 
-def compute_intercell_distances(
-    sender_cells: torch.FloatTensor,
-    receiver_cells: torch.FloatTensor,
-    pos: torch.FloatTensor,
-) -> torch.FloatTensor:
+def compute_intercell_distances(sender_cells, receiver_cells, pos):
     """
-    Compute the pairwise distances between nodes within each cell.
+    Compute the maximum distance between every pair of cells.
 
     Parameters
     ----------
-    sender_cells : torch.FloatTensor
-        A 2D tensor of shape (n, k_1) containing indices of nodes for n sender cells.
-    receiver_cells : torch.FloatTensor
-        A 2D tensor of shape (n, k_2) containing indices of nodes for n receiver cells.
-    pos : torch.FloatTensor
-        A 2D tensor of shape (m, 3) representing the 3D positions of m nodes.
+    sender_cells : list[list[int]]
+        Each inner list is the node‐indices for one “sender” cell.
+    receiver_cells : list[list[int]]
+        Each inner list is the node‐indices for one “receiver” cell.
+    pos : torch.Tensor, shape [N, D]
+        Cartesian coordinates of all N nodes.
 
     Returns
     -------
-    torch.FloatTensor
-        A 3D tensor of shape (n, k_1, k_2) containing the pairwise distances between nodes within
-        each of the n cells.
-
-    Notes
-    -----
-    This function handles cells with varying numbers of nodes by using NaN values in the
-    `sender_cells` and `receiver_cells` tensors to indicate missing nodes. It computes distances for
-    valid (non-NaN) nodes within each pair of sender and receiver cells. For combinations involving
-    at least one NaN node, the computed distance is set to NaN.
+    torch.Tensor, shape [len(sender_cells), len(receiver_cells)]
+        distance_matrix[i, j] = max_{u in sender_cells[i], v in receiver_cells[j]} ||pos[u] - pos[v]||
     """
-    # Cast nans to 0 to compute distances in a vectorized fashion
-    sender_cells_filled = sender_cells.nan_to_num(0).to(torch.int64)
-    receiver_cells_filled = receiver_cells.nan_to_num(0).to(torch.int64)
-    sender_positions = pos[sender_cells_filled]
-    receiver_positions = pos[receiver_cells_filled]
-    dist_matrix = torch.norm(
-        sender_positions.unsqueeze(2) - receiver_positions.unsqueeze(1), dim=3
+    num_s = len(sender_cells)
+    num_r = len(receiver_cells)
+    # Preallocate output
+    distance_matrix = pos.new_zeros((num_s, num_r))
+
+    for i, s in enumerate(sender_cells):
+        for j, r in enumerate(receiver_cells):
+            if len(s) == 0 or len(r) == 0:
+                distance_matrix[i, j] = 0.0
+                continue
+            # Gather coordinates
+            coords_s = pos[s]              # [|s|, D]
+            coords_r = pos[r]              # [|r|, D]
+            # Compute all pairwise distances
+            # coords_s[:, None, :] expands to [|s|,1,D]
+            # coords_r[None, :, :] expands to [1,|r|,D]
+            diffs = coords_s[:, None, :] - coords_r[None, :, :]  # [|s|,|r|,D]
+            dists = torch.norm(diffs, dim=-1)                    # [|s|,|r|]
+            # Maximum over all pairs
+            distance_matrix[i, j] = dists.max()
+    return distance_matrix
+
+
+def compute_centroids(cells, pos):
+    """
+    Compute Cartesian centroids for a list of combinatorial cells.
+
+    Parameters
+    ----------
+    cells : list[list[int]]
+        Each entry is a cell, given by the list of node indices it contains.
+    pos : torch.Tensor, shape [N, D]
+        Cartesian coordinates of the N nodes.
+
+    Returns
+    -------
+    torch.Tensor, shape [num_cells, D]
+        The centroid of each cell, computed by averaging its node positions.
+    """
+    import torch
+    from etnn.utils import scatter_mean
+
+    # 1) Flatten all node indices and remember which cell they came from
+    ids = []
+    idx_map = []
+    for cell_id, cell_nodes in enumerate(cells):
+        ids.extend(cell_nodes)
+        idx_map.extend([cell_id] * len(cell_nodes))
+
+    # 2) Handle the empty‐cells case
+    if len(ids) == 0:
+        # No cells → return empty tensor with correct number of dims
+        return pos.new_empty((0, pos.size(1)))
+
+    # 3) Build tensors for scatter_mean
+    ids_tensor    = torch.tensor(ids,    dtype=torch.long, device=pos.device)
+    idx_map_tensor = torch.tensor(idx_map, dtype=torch.long, device=pos.device)
+
+    # 4) Compute centroids by averaging node positions per cell
+    centroids = scatter_mean(
+        pos[ids_tensor],      # [total_nodes_in_all_cells, D]
+        idx_map_tensor,       # [total_nodes_in_all_cells]
+        dim=0,
+        dim_size=len(cells)   # number of cells
     )
-
-    # Set distances for invalid combinations to nan
-    sender_mask = ~torch.isnan(sender_cells)
-    receiver_mask = ~torch.isnan(receiver_cells)
-    valid_combinations_mask = sender_mask.unsqueeze(2) & receiver_mask.unsqueeze(1)
-    dist_matrix[~valid_combinations_mask] = torch.nan
-
-    return dist_matrix
-
-
-def compute_centroids(
-    cells: torch.FloatTensor, features: torch.FloatTensor
-) -> torch.FloatTensor:
-    """
-    Compute the centroids of cells based on their constituent nodes' features.
-
-    This function calculates the mean feature vector (centroid) for each cell defined by `cells`,
-    using the provided `features` for each node. It handles cells with varying numbers of nodes,
-    including those with missing values (NaNs), by treating them as absent nodes.
-
-    Parameters
-    ----------
-    cells : torch.FloatTensor
-        A 2D tensor of shape (num_cells, max_cell_size) containing indices of nodes for each cell.
-        Indices may include NaNs to indicate absent nodes in cells with fewer nodes than
-        `max_cell_size`.
-    features : torch.FloatTensor
-        A 2D tensor of shape (num_nodes, num_features) containing feature vectors for each node.
-
-    Returns
-    -------
-    torch.FloatTensor
-        A 2D tensor of shape (num_cells, num_features) containing the computed centroids for each
-        cell.
-
-    Notes
-    -----
-    The function creates an intermediate tensor, `features_padded`, which is a copy of `features`
-    with an additional row of zeros at the end. This increases the memory footprint, as it
-    temporarily duplicates the `features` tensor. The purpose of this padding is to safely handle -1
-    indices resulting from NaNs in `cells`, allowing vectorized operations without explicit NaN
-    checks.
-    """
-    zeros_row = torch.zeros(1, features.shape[1], device=features.device)
-    features_padded = torch.cat([features, zeros_row], dim=0)
-    cells_int = cells.nan_to_num(-1).to(torch.int64)
-    nodes_features = features_padded[cells_int]
-    sum_features = torch.sum(nodes_features, dim=1)
-    cell_cardinalities = torch.sum(cells_int != -1, dim=1, keepdim=True)
-    centroids = sum_features / cell_cardinalities
     return centroids
-
 
 @dataclass
 class SparseInvariantComputationIndices:
@@ -451,30 +443,31 @@ def compute_invariants_sparse(
     centroids: dict[str, torch.Tensor] = {}
     diameters: dict[str, torch.Tensor] = {}
     for rank, cells in cell_ind.items():
-        # compute centroids
+        # gather node indices flatten for this rank
         ids: list[int] = []
         for c in cells:
             ids.extend(c)
-
-        sizes: list[int] = []
-        index: list[int] = []
+        # build a scatter-index mapping each node to its cell sizes
+        sizes, index = [], []
         for i, c in enumerate(cells):
-            sizes.append(len(c))
-            index.extend([i] * len(c))
-        index = torch.tensor(index).to(dev)
-        centroids[rank] = utils.scatter_mean(
-            pos[ids], index, dim=0, dim_size=len(cells)
-        )
+            sizes.append(len(c)); index.extend([i] * len(c))
+        index = torch.tensor(index, device=dev)
+        # compute fractional centroids under PBC
+        frac_centroid = utlis.scatter_mean(
+                frac_pos[ids], index, dim = 0, dim_size = len(cells)
+                )
+        # map back to cartesian coordinates
+        centroids[rank] = frac_centroid @ lattice.T
 
         # compute diameters (max pairwise distance)
         agg = rank_agg_indices[rank]
-        if diff_high_order:
-            pos_send = pos[agg.atoms_ids_send]
-            pos_recv = pos[agg.atoms_ids_recv]
-        else:
-            pos_send = pos.detach()[agg.atoms_ids_send]
-            pos_recv = pos.detach()[agg.atoms_ids_recv]
-        dist = torch.norm(pos_send - pos_recv, dim=-1)
+        # PBC‐aware diameter: wrap each node‐pair in fractional space
+        fp_send = frac_pos[agg.atoms_ids_send]
+        fp_recv = frac_pos[agg.atoms_ids_recv]
+        df      = fp_recv - fp_send
+        df_wrap = df - torch.round(df)                # minimum‐image frac
+        dc      = df_wrap @ lattice.T                 # back to Cartesian
+        dist    = torch.norm(dc, dim=-1)              # [#pairs]
         index = torch.tensor(agg.cell_ids).to(dev)
         diameters[rank] = utils.scatter_max(dist, index, dim=0, dim_size=len(cells))
 
@@ -489,9 +482,11 @@ def compute_invariants_sparse(
             continue
 
         # centroid dist
-        centroids_send = centroids[send_rank][cell_pairs[0]]
-        centroids_recv = centroids[recv_rank][cell_pairs[1]]
-        centroids_dist = torch.norm(centroids_send - centroids_recv, dim=1)
+        # PBC‐aware centroid distance
+        c_send = centroids[send_rank][cell_pairs[0]]
+        c_recv = centroids[recv_rank][cell_pairs[1]]
+        # but centroids were already Cartesian‐mapped, so simple norm
+        centroids_dist = torch.norm(c_send - c_recv, dim=1)
 
         # diameter
         diameter_send = diameters[send_rank][cell_pairs[0]]

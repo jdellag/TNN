@@ -104,11 +104,21 @@ def rips_lift(graph: Data, dim: int, dis: float, fc_nodes: bool = True) -> set[C
         for u, v in combinations(nodes, 2):
             simplex_tree.insert([u, v])
 
-    # At this point, you may wish to manually expand the tree
-    # to higher‐order cells (2‐simplices, 3‐simplices, …) up to `dim`,
-    # since we bypassed `RipsComplex.create_simplex_tree`. For example:
-    # simplex_tree.expand_to_dimension(dim)
-
+    # --- manual clique‐expansion up to dimension `dim` ---
+    # build a set of undirected edges for quick lookup
+    edge_set = {
+        frozenset((u, v))
+        for u, v in zip(edge_index[0].tolist(), edge_index[1].tolist())
+        if u < v
+    }
+    nodes = list(range(x_0.size(0)))
+    # for each p from 2→dim, consider all (p+1)-node combinations
+    for p in range(2, dim + 1):
+        for simplex in combinations(nodes, p + 1):
+            # check that every 2-subset (edge) is present
+            if all(frozenset(edge) in edge_set
+                   for edge in combinations(simplex, 2)):
+                simplex_tree.insert(list(simplex))
     # Convert to a set of frozensets (Cells)
     simplexes = set()
     for simplex, _ in simplex_tree.get_simplices():

@@ -1,6 +1,13 @@
 ## hydra
 /outputs
 
+
+# ignore raw QM9 archives
+path/to/qm9/raw/
+*.sdf
+*.sdf.csv
+config.yaml
+
 ## data
 data/
 !data/input/egnn_splits.json
