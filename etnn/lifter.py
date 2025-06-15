@@ -523,137 +523,78 @@ class CombinatorialComplexTransform(BaseTransform):
 
     def graph_to_ccdict(self, graph: Data) -> dict[str, list]:
         """
-        Convert a graph to a combinatorial complex dictionary.
-
-        TODO: refactor into simpler functions.
+        Convert a graph (PyG Data) into a combinatorial‐complex dict,
+        including PBC cell_offsets for each adjacency.
 
         Parameters
         ----------
         graph : Data
-            The input graph.
-
-        Returns
-        -------
-        dict[str, list]
-            The combinatorial complex dictionary.
-
-        Raises
-        ------
-        AssertionError
-            If the processed adjacencies do not match the expected adjacencies.
-
-        Notes
-        -----
-        The combinatorial complex dictionary is created by performing the following steps:
-
-        1. Compute the cells of the graph using the lifter.
-        memberships.
-        2. Extract the cell indices and memberships from the cell dictionary.
-        3. Create the combinatorial complex using the `create_combinatorial_complex` method.
-        4. Compute the adjacencies and incidences of the combinatorial complex.
-        5. Merge matching adjacencies if the `merge_neighbors` flag is set to True.
-        6. Convert the sparse numpy matrices to dense torch tensors.
-        7. Store the nodes for computing geometric features in the inv_dict.
-        8. Convert the graph and other data to a dictionary format.
-        9. Convert tensors in the dictionary to lists.
-
-        The resulting combinatorial complex dictionary contains the following keys:
-        - 'x': features of rank 0 cells (atoms)
-        - 'pos': positions of rank 0 cells (atoms)
-        - 'y': target values
-        - 'x_i': feature vectors for each rank i
-        - 'cell_i': cell indices for each rank i
-        - 'mem_i': cell memberships for each rank i
-        - 'adj_adj_type': adjacency matrices for each adjacency type
-        - 'inv_adj_type': nodes used for computing geometric features for each adjacency type
-
-        The combinatorial complex dictionary can be stored as a .json file.
+            A torch_geometric.data.Data object previously transformed by
+            CombinatorialComplexTransform.  Must have attribute:
+                graph.cell_offsets_map : dict[str → LongTensor(E×3)]
         """
 
-        # compute cells
-        cc_dict = self.lifter.lift(graph)
+        # 1) Run your lifter to get raw cc_dict lists for cells, x, mem:
+        base_cc = self.lifter.lift(graph)
 
-        # compute cell indices and memberships
-        cell_dict, x_dict, mem_dict = extract_cell_and_membership_data(cc_dict)
+        # 2) Extract cell indices and memberships
+        cell_dict, x_dict, mem_dict = extract_cell_and_membership_data(base_cc)
 
-        # create the combinatorial complex
-        cc = create_combinatorial_complex(cc_dict)
+        # 3) Build the combinatorial complex
+        cc = create_combinatorial_complex(base_cc)
 
-        # compute adjancencies and incidences
-        adj_dict = dict()
+        # 4) Compute adjacency matrices
+        adj_dict: dict[str, list] = {}
         for adj_type in self.adjacencies:
-            ranks = [int(rank) for rank in adj_type.split("_")]
-            i, j = ranks[:2]
+            ranks = [int(r) for r in adj_type.split("_")]
+            i, j = ranks[0], ranks[1]
             if i != j:
                 matrix = incidence_matrix(cc, i, j)
             else:
-                # if i == j, we must have a third rank specifying via_rank
-                assert len(ranks) == 3
-                matrix = adjacency_matrix(cc, i, ranks[2])
-
-            adj_dict[adj_type] = matrix
-
-        # merge matching adjacencies
-        # if self.merge_neighbors:
-        #     adj_dict, processed_adjacencies = merge_neighbors(adj_dict)
-        #     assert set(processed_adjacencies) == set(self.processed_adjacencies)
-
-        # convert from sparse numpy matrices list of index lists
-        for adj_type, matrix in adj_dict.items():
+                # i == j → use the third rank for same‐rank adjacency
+                via = ranks[2]
+                matrix = adjacency_matrix(cc, i, via)
+            # convert sparse to list‐of‐indices
             adj_dict[adj_type] = sparse_to_dense(matrix)
 
-        # for each adjacency/incidence, store the nodes to be used for computing geometric features
-        # inv_dict = dict()
-        # for adj_type in processed_adjacencies:
-        #     inv_dict[adj_type] = []
-        #     neighbors = adj_dict[adj_type]
-        #     ranks = [int(rank) for rank in adj_type.split("_")]
-        #     i, j = ranks[:2]
-
-        #     num_edges = len(neighbors[0])
-        #     for edge_idx in range(num_edges):
-        #         idx_a, idx_b = neighbors[0][edge_idx], neighbors[1][edge_idx]
-        #         cell_a = cell_dict[i][idx_a]
-        #         cell_b = cell_dict[j][idx_b]
-        #         shared = [node for node in cell_a if node in cell_b]
-        #         only_in_a = [node for node in cell_a if node not in shared]
-        #         only_in_b = [node for node in cell_b if node not in shared]
-        #         inv_nodes = shared + only_in_b + only_in_a
-        #         inv_dict[adj_type].append(inv_nodes)
-
+        # 5) Start fresh cc_dict from the original graph metadata
         cc_dict = graph.to_dict()
 
-        for k, v in cell_dict.items():
-            cc_dict[f"cell_{k}"] = v
+        # 6) Inject cells, features, memberships, and adjacencies
+        for rank, cells in cell_dict.items():
+            cc_dict[f"cell_{rank}"] = cells
+        for rank, feats in x_dict.items():
+            cc_dict[f"x_{rank}"] = feats
+        for rank, mem in mem_dict.items():
+            cc_dict[f"mem_{rank}"] = mem
+        for adj_type, idx_list in adj_dict.items():
+            cc_dict[f"adj_{adj_type}"] = idx_list
+        # build PBC‐offsets map from the Data attribute
+        cell_offsets_map = graph.cell_offsets_map
+        # 7) *** NEW *** Retrieve the PBC offsets map from the Data
+        cell_offsets_map = getattr(graph, "cell_offsets_map", None)
+        if cell_offsets_map is None:
+            raise RuntimeError(
+                "graph_to_ccdict expected graph.cell_offsets_map to be set"
+            )
+        # 8) Store each adjacency’s [E×3] offsets
+        for adj_type, offsets in cell_offsets_map.items():
+            # offsets is a LongTensor of shape [E, 3]
+            cc_dict[f"cell_offsets_{adj_type}"] = offsets.tolist()
 
-        for k, v in x_dict.items():
-            cc_dict[f"x_{k}"] = v
-
-        for k, v in mem_dict.items():
-            cc_dict[f"mem_{k}"] = v
-
-        for k, v in adj_dict.items():
-            cc_dict[f"adj_{k}"] = v
-
-        # for k, v in inv_dict.items():
-        #     cc_dict[f"inv_{k}"] = v
-
-        # store the number of features for each rank for tensor reconstruction
+        # 9) Store num_features metadata
         cc_dict["num_features_dict"] = {}
         for rank in range(self.lifter.dim + 1):
             cc_dict["num_features_dict"][rank] = self.lifter.num_features_dict[rank]
 
-        for att in ["edge_attr", "edge_index"]:
-            if att in cc_dict.keys():
-                cc_dict.pop(att)
+        # 10) Cleanup any unwanted keys
+        for key in ["edge_attr", "edge_index", "mol"]:
+            cc_dict.pop(key, None)
 
-        # convert tensors to lists
-        for k, v in cc_dict.items():
+        # 11) Convert all remaining tensors to Python lists
+        for k, v in list(cc_dict.items()):
             if torch.is_tensor(v):
                 cc_dict[k] = v.tolist()
-
-        # remove the molecule from the dictionary
-        cc_dict.pop("mol")
 
         return cc_dict
 

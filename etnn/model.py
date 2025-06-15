@@ -135,18 +135,20 @@ class ETNN(nn.Module):
     def forward(self, graph: Data) -> Tensor:
         device = graph.pos.device
 
+        # 1) Build cell indices for geometric features
         cell_ind = {
             str(i): graph.cell_list(i, format=self.cell_list_fmt)
             for i in self.visible_dims
         }
 
+        # 2) Load adjacency index lists
         adj = {
             adj_type: getattr(graph, f"adj_{adj_type}")
             for adj_type in self.adjacencies
             if hasattr(graph, f"adj_{adj_type}")
         }
 
-        # compute initial features
+        # 3) Compute initial features (centroids, memberships, hetero)
         features = {}
         for feature_type in self.initial_features:
             features[feature_type] = {}
@@ -163,16 +165,13 @@ class ETNN(nn.Module):
 
         x = {
             str(i): torch.cat(
-                [
-                    features[feature_type][str(i)]
-                    for feature_type in self.initial_features
-                ],
+                [features[ft][str(i)] for ft in self.initial_features],
                 dim=1,
             )
             for i in self.visible_dims
         }
 
-        # if using sparse invariant computation, obtain indces
+        # 4) Prepare kwargs for invariant computation
         inv_comp_kwargs = {
             "cell_ind": cell_ind,
             "adj": adj,
@@ -184,52 +183,61 @@ class ETNN(nn.Module):
             )
             inv_comp_kwargs["rank_agg_indices"] = agg_indices
 
-        # embed features and E(n) invariant information
+        # 5) Embed features and compute invariants
         pos = graph.pos
-        x = {dim: self.feature_embedding[dim](feature) for dim, feature in x.items()}
+        x = {dim: self.feature_embedding[dim](feat) for dim, feat in x.items()}
         inv = self.inv_fun(pos, **inv_comp_kwargs)
-
         if self.normalize_invariants:
             inv = {
-                adj: self.inv_normalizer[adj](feature) for adj, feature in inv.items()
+                at: self.inv_normalizer[at](feat) for at, feat in inv.items()
             }
 
-        # message passing
+        # ── NEW: Build the PBC cell‐offsets map for message‐passing ──
+        cell_offsets_map = {
+            at: getattr(graph, f"cell_offsets_{at}")
+            for at in self.adjacencies
+        }
+        # ────────────────────────────────────────────────────────────
+
+        # 6) Message‐passing layers (with PBC‐aware geometry)
         for layer in self.layers:
-            x, pos = layer(x, adj, inv, pos)
+            x, pos = layer(
+                x,
+                adj,
+                inv,
+                pos,
+                graph.frac_pos,
+                graph.lattice,
+                cell_offsets_map,
+            )
+            # If positions are updated, recompute invariants
             if self.pos_update:
                 inv = self.inv_fun(pos, **inv_comp_kwargs)
                 if self.normalize_invariants:
                     inv = {
-                        adj: self.inv_normalizer[adj](feature)
-                        for adj, feature in inv.items()
+                        at: self.inv_normalizer[at](feat)
+                        for at, feat in inv.items()
                     }
-            # apply dropout if needed
+            # Optional dropout
             if self.dropout > 0:
                 x = {
-                    dim: nn.functional.dropout(feature, p=self.dropout)
-                    for dim, feature in x.items()
+                    dim: nn.functional.dropout(feat, p=self.dropout)
+                    for dim, feat in x.items()
                 }
 
-        # read out
-        out = {dim: self.pre_pool[dim](feature) for dim, feature in x.items()}
-
+        # 7) Readout / pooling
+        out = {dim: self.pre_pool[dim](feat) for dim, feat in x.items()}
         if self.global_pool:
-            # create one dummy node with all features equal to zero for each graph and each rank
             cell_batch = {
                 str(i): utils.slices_to_pointer(graph._slice_dict[f"slices_{i}"])
                 for i in self.visible_dims
             }
             out = {
                 dim: global_add_pool(out[dim], cell_batch[dim])
-                for dim, feature in out.items()
+                for dim in out
             }
-            state = torch.cat(
-                tuple([feature for dim, feature in out.items()]),
-                dim=1,
-            )
-            out = self.post_pool(state)
-            out = torch.squeeze(out, -1)
+            state = torch.cat(tuple(out.values()), dim=1)
+            out = torch.squeeze(self.post_pool(state), -1)
 
         return out
 

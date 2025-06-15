@@ -11,65 +11,85 @@ class ETNNLayer(nn.Module):
     def __init__(
         self,
         adjacencies: List[str],
-        visible_dims: list[int],
+        visible_dims: List[int],
         num_hidden: int,
-        num_features_map: dict[str, int],
+        num_features_map: Dict[str, int],
         batch_norm: bool = False,
         lean: bool = True,
         pos_update: bool = False,
     ) -> None:
         super().__init__()
         self.adjacencies = adjacencies
-        self.num_features_map = num_features_map
         self.visible_dims = visible_dims
+        self.num_features_map = num_features_map
         self.batch_norm = batch_norm
         self.lean = lean
         self.pos_update = pos_update
 
-        # messages
-        self.message_passing = nn.ModuleDict(
-            {
-                adj: BaseMessagePassingLayer(
-                    num_hidden,
-                    self.num_features_map[adj],
-                    batch_norm=batch_norm,
-                    lean=lean,
-                )
-                for adj in adjacencies
-            }
-        )
+        # message‐passing modules for each adjacency type
+        self.message_passing = nn.ModuleDict({
+            adj: BaseMessagePassingLayer(
+                num_hidden,
+                self.num_features_map[adj],
+                batch_norm=batch_norm,
+                lean=lean,
+            )
+            for adj in adjacencies
+        })
 
-        # state update
+        # state update MLPs by cell‐rank
         self.update = nn.ModuleDict()
-        for dim in self.visible_dims:
-            factor = 1 + sum([adj_type[2] == str(dim) for adj_type in adjacencies])
-            update_layers = [nn.Linear(factor * num_hidden, num_hidden)]
+        for dim in visible_dims:
+            factor = 1 + sum(adj_type[2] == str(dim) for adj_type in adjacencies)
+            layers = [nn.Linear(factor * num_hidden, num_hidden)]
             if self.batch_norm:
-                update_layers.append(nn.BatchNorm1d(num_hidden))
+                layers.append(nn.BatchNorm1d(num_hidden))
             if not self.lean:
-                extra_layers = [nn.SiLU(), nn.Linear(num_hidden, num_hidden)]
+                extra = [nn.SiLU(), nn.Linear(num_hidden, num_hidden)]
                 if self.batch_norm:
-                    extra_layers.append(nn.BatchNorm1d(num_hidden))
-                update_layers.extend(extra_layers)
-            self.update[str(dim)] = nn.Sequential(*update_layers)
+                    extra.append(nn.BatchNorm1d(num_hidden))
+                layers.extend(extra)
+            self.update[str(dim)] = nn.Sequential(*layers)
 
-        # position update
+        # optional position‐update weights
         if pos_update:
             self.pos_update_wts = nn.Linear(num_hidden, 1, bias=False)
             nn.init.trunc_normal_(self.pos_update_wts.weight, std=0.02)
 
     def radial_pos_update(
-        self, pos: Tensor, mes: dict[str, Tensor], adj: dict[str, Tensor]
+        self,
+        pos: Tensor,
+        mes: Dict[str, Tensor],
+        adj: Dict[str, Tensor],
+        frac_pos: Tensor,
+        lattice: Tensor,
+        cell_offsets_map: Dict[str, Tensor],
     ) -> Tensor:
-        # find the key corresponding to the 0_0_x adjacency
-        key = [k for k in adj if k[0] == "0" and k[2] == "0"][0]
-        send, recv = adj[key]
-        wts = self.pos_update_wts(mes[key][recv])
+        """
+        PBC‐aware coordinate update for 0→0 adjacency only.
+        """
+        # locate the node‐to‐node adjacency key
+        key = next(k for k in adj if k[0] == "0" and k[2] == "0")
+        send, recv = adj[key]                          # each [E]
+        offsets = cell_offsets_map[key]                # [E×3]
 
-        # collect the pos_delta for each node: going from
-        # [num_edges, num_hidden] to [num_nodes, num_hidden]
+        # edge weights from messages at receiver
+        wts = self.pos_update_wts(mes[key][recv])      # [E×1]
+
+        # minimum‐image Δf in frac‐space, then apply integer offsets
+        df = frac_pos[send] - frac_pos[recv]           # [E×3]
+        df_wrap = df - torch.round(df)                 # wrap to (–0.5,0.5]
+        df_wrap = df_wrap + offsets.to(df_wrap)        # apply cell shifts
+
+        # back to Cartesian
+        dc = df_wrap @ lattice.T                       # [E×3]
+
+        # scatter‐add weighted displacements
         delta = utils.scatter_add(
-            (pos[send] - pos[recv]) * wts, send, dim=0, dim_size=pos.size(0)
+            dc * wts,                                  # [E×3] × [E×1] → [E×3]
+            send,
+            dim=0,
+            dim_size=pos.size(0),
         )
         return pos + 0.1 * delta
 
@@ -79,8 +99,11 @@ class ETNNLayer(nn.Module):
         adj: Dict[str, Tensor],
         inv: Dict[str, Tensor],
         pos: Tensor,
-    ) -> Dict[str, Tensor]:
-        # pass the different messages of all adjacency types
+        frac_pos: Tensor,
+        lattice: Tensor,
+        cell_offsets_map: Dict[str, Tensor],
+    ) -> (Dict[str, Tensor], Tensor):
+        # 1) Compute messages for each adjacency
         mes = {
             adj_type: self.message_passing[adj_type](
                 x=(x[adj_type[0]], x[adj_type[2]]),
@@ -90,23 +113,58 @@ class ETNNLayer(nn.Module):
             for adj_type in self.adjacencies
         }
 
-        # find update states through concatenation, update and add residual connection
+        # 2) State update per rank via concatenation + MLP + residual
         h = {
             dim: torch.cat(
-                [feature]
-                + [adj_mes for adj_type, adj_mes in mes.items() if adj_type[2] == dim],
+                [x[dim]] +
+                [mes[a] for a in self.adjacencies if a[2] == dim],
                 dim=1,
             )
-            for dim, feature in x.items()
+            for dim in x
         }
-        h = {dim: self.update[dim](feature) for dim, feature in h.items()}
-        x = {dim: feature + h[dim] for dim, feature in x.items()}
+        h = {dim: self.update[dim](h_dim) for dim, h_dim in h.items()}
+        x = {dim: x[dim] + h[dim] for dim in x}
 
+        # 3) Optional position update (PBC‐aware)
         if self.pos_update:
-            pos = self.radial_pos_update(pos, mes, adj)
+            pos = self.radial_pos_update(
+                pos, mes, adj, frac_pos, lattice, cell_offsets_map
+            )
 
         return x, pos
 
+
+# Keep your BaseMessagePassingLayer below unchanged
+class BaseMessagePassingLayer(nn.Module):
+    def __init__(self, num_hidden, num_inv, batch_norm: bool = False, lean: bool = True):
+        super().__init__()
+        self.batch_norm = batch_norm
+        self.lean = lean
+        layers = [
+            nn.Linear(2 * num_hidden + num_inv, num_hidden),
+            nn.SiLU(),
+        ]
+        if self.batch_norm:
+            layers.insert(1, nn.BatchNorm1d(num_hidden))
+        if not self.lean:
+            extra = [
+                nn.Linear(num_hidden, num_hidden),
+                nn.SiLU(),
+            ]
+            if self.batch_norm:
+                extra.insert(1, nn.BatchNorm1d(num_hidden))
+            layers.extend(extra)
+        self.message_mlp = nn.Sequential(*layers)
+        self.edge_inf_mlp = nn.Sequential(nn.Linear(num_hidden, 1), nn.Sigmoid())
+
+    def forward(self, x, index, edge_attr):
+        send, recv = index
+        x_send, x_recv = x
+        m_send, m_recv = x_send[send], x_recv[recv]
+        state = torch.cat((m_send, m_recv, edge_attr), dim=1)
+        msgs = self.message_mlp(state)
+        wts = self.edge_inf_mlp(msgs)
+        return utils.scatter_add(msgs * wts, recv, dim=0, dim_size=x_recv.size(0))
 
 class BaseMessagePassingLayer(nn.Module):
     def __init__(

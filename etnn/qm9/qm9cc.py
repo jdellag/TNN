@@ -233,6 +233,7 @@ class QM9CC(InMemoryDataset):
         super().__init__(
             root, transform, pre_transform, pre_filter, force_reload=force_reload
         )
+        self.lattice = lattice
         self.load(self.processed_paths[0])
 
     def mean(self, target: int) -> float:
@@ -362,7 +363,7 @@ class QM9CC(InMemoryDataset):
             # ——— add lattice info for periodic boundary conditions ———
             # For a molecular crystal, you’ll pass in your 3×3 cell vectors;
             # here we just demonstrate the API. You can replace `A` with your real cell.
-            A = torch.eye(3)                                 # placeholder: replace with actual lattice
+            A = torch.tensor(self.lattice, dtype=torch.float)
             data.lattice = A                                 # [3×3] matrix of cell basis vectors
 
             # Compute fractional coords f in [0,1)³:
