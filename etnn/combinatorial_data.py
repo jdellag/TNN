@@ -248,3 +248,33 @@ class CombinatorialComplexData(Data):
                 attr[key] = torch.tensor(value, dtype=cls.attr_dtype["adj_"])
 
         return cls.from_dict(attr)
+
+    @staticmethod
+    def __cat_dim__(key, value, *args, **kwargs):
+        """
+        Tell PyG how to concatenate custom fields when batching.
+        - lattice  → stack as a new batch dimension → return None
+        - frac_pos and cell_offsets_* → concat along dim=0 → return 0
+        """
+        if key == "lattice":
+            return None       # new batch axis: Batch.lattice will be [B,3,3]
+        if key.startswith("cell_offsets_"):
+            return 0          # concat along rows, like edge_index
+        if key == "frac_pos":
+            return 0          # concat along rows, like pos
+        # fall back to default behavior for everything else
+        return super().__cat_dim__(key, value, *args, **kwargs)
+
+
+    def __inc__(self, key: str, value: any, *args, **kwargs):
+        """
+        Tell PyG how much to increment index‐type fields when batching.
+        Now accepts the extra `store` argument that PyG passes in.
+        """
+        if key.startswith("adj_"):
+            # key = "adj_<i>_<j>"; the <i> is the sender rank
+            rank = int(key.split("_")[1])
+            # Use the built‐in num_cells() method
+            return self.num_cells(rank)
+        # Pass along any extra args (e.g. the `store`) to the superclass
+        return super().__inc__(key, value, *args, **kwargs)
