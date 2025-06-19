@@ -544,19 +544,32 @@ class CombinatorialComplexTransform(BaseTransform):
         cc = create_combinatorial_complex(base_cc)
 
         # 4) Compute adjacency matrices
-        adj_dict: dict[str, list] = {}
+        adj_dict = {}
         for adj_type in self.adjacencies:
-            ranks = [int(r) for r in adj_type.split("_")]
-            i, j = ranks[0], ranks[1]
-            if i != j:
-                matrix = incidence_matrix(cc, i, j)
-            else:
-                # i == j → use the third rank for same‐rank adjacency
-                via = ranks[2]
-                matrix = adjacency_matrix(cc, i, via)
-            # convert sparse to list‐of‐indices
-            adj_dict[adj_type] = sparse_to_dense(matrix)
+            parts = [int(r) for r in adj_type.split("_")]
+            i, j = parts[:2]                     # sender-rank, receiver-rank
 
+            if i != j:
+                # ---------- incidence between different ranks ----------
+                if i < j:
+                    # normal direction (low->high)
+                    mat = incidence_matrix(cc, i, j)          # sparse scipy.coo_matrix
+                    idx = sparse_to_dense(mat)                # [[send],[recv]]
+                else:
+                    # reverse direction (high->low) … build the SAME matrix
+                    # then flip the rows so [ring,bond] → [bond,ring] becomes [ring, bond]
+                    mat = incidence_matrix(cc, j, i)          # build low->high first
+                    raw = sparse_to_dense(mat)                # [[low],[high]]
+                    idx = [raw[1], raw[0]]                    # swap to match (high,low)
+
+            else:
+                # ---------- same-rank adjacency via a third rank ----------
+                via_rank = parts[2]
+                mat = adjacency_matrix(cc, i, via_rank)
+                idx = sparse_to_dense(mat)
+
+            # store list-of-index tensors
+            adj_dict[adj_type] = idx
         # 5) Start fresh cc_dict from the original graph metadata
         cc_dict = graph.to_dict()
 
@@ -568,7 +581,7 @@ class CombinatorialComplexTransform(BaseTransform):
         for rank, mem in mem_dict.items():
             cc_dict[f"mem_{rank}"] = mem
         for adj_type, idx_list in adj_dict.items():
-            cc_dict[f"adj_{adj_type}"] = idx_list
+            cc_dict[f"adj_{adj_type}"] = idx_list.tolist()
         # build PBC‐offsets map from the Data attribute
         cell_offsets_map = graph.cell_offsets_map
         # 7) *** NEW *** Retrieve the PBC offsets map from the Data

@@ -45,7 +45,7 @@ class ETNN(nn.Module):
         self.lean = lean
         max_dim = max(num_features_per_rank.keys())
         self.global_pool = global_pool
-        self.visible_dims = visible_dims
+        self.visible_dims = list(range(max_dim + 1))
         self.pos_update = pos_update
         self.dropout = dropout
 
@@ -53,7 +53,7 @@ class ETNN(nn.Module):
         self.sparse_invariant_computation = sparse_invariant_computation
         self.sparse_agg_max_cells = sparse_agg_max_cells
         self.hausdorff = hausdorff_dists
-        self.cell_list_fmt = "list" if sparse_invariant_computation else "padded"
+        self.cell_list_fmt = "list"# if sparse_invariant_computation else "padded"
 
         if sparse_invariant_computation:
             self.inv_fun = invariants.compute_invariants_sparse
@@ -105,7 +105,7 @@ class ETNN(nn.Module):
 
         self.pre_pool = nn.ModuleDict()
 
-        for dim in visible_dims:
+        for dim in self.visible_dims:
             if self.global_pool:
                 if not self.lean:
                     self.pre_pool[str(dim)] = nn.Sequential(
@@ -137,7 +137,7 @@ class ETNN(nn.Module):
 
         # 1) Build cell indices for geometric features
         cell_ind = {
-            str(i): graph.cell_list(i, format=self.cell_list_fmt)
+            str(i): graph.cell_list(i, format="list")
             for i in self.visible_dims
         }
 
@@ -182,21 +182,53 @@ class ETNN(nn.Module):
                 cell_ind, adj, self.sparse_agg_max_cells
             )
             inv_comp_kwargs["rank_agg_indices"] = agg_indices
-
+        for adj_type, idx in adj.items():
+            assert idx.dtype == torch.long, f"{adj_type} is {idx.dtype}"
         # 5) Embed features and compute invariants
         pos = graph.pos
         x = {dim: self.feature_embedding[dim](feat) for dim, feat in x.items()}
-        inv = self.inv_fun(pos, **inv_comp_kwargs)
+        # Compute E(n) invariants, now including PBC info
+        inv = self.inv_fun(
+            pos,
+            frac_pos=graph.frac_pos,
+            lattice=graph.lattice,
+            **inv_comp_kwargs,
+        )
         if self.normalize_invariants:
             inv = {
                 at: self.inv_normalizer[at](feat) for at, feat in inv.items()
             }
 
         # ── NEW: Build the PBC cell‐offsets map for message‐passing ──
-        cell_offsets_map = {
-            at: getattr(graph, f"cell_offsets_{at}")
-            for at in self.adjacencies
-        }
+        # make sure BOTH edge_index_* and cell_offsets_* exist
+        # if they are missing, we fabricate empty/zero tensors so that the
+        # rest of the pipeline can still run (no rank-0 edges for that graph).
+        # ------------------------------------------------------------------
+        cell_offsets_map = {}
+        for at in self.adjacencies:
+            ei_key  = f"edge_index_{at}"
+            off_key = f"cell_offsets_{at}"
+        
+        #    if not hasattr(graph, ei_key):
+        #         # No edges of this type in this batch → create a dummy [2,0] tensor
+        #        empty_ei = torch.empty(2, 0,
+        #                                dtype=torch.long,
+        #                                device=graph.x.device)
+        #        setattr(graph, ei_key, empty_ei)
+            if not hasattr(graph, ei_key):
+                # No edges of this type in this batch → create a dummy [2,0] tensor
+                dev = _infer_device(graph)
+                empty_ei = torch.empty(2, 0, dtype=torch.long, device=dev)
+                setattr(graph, ei_key, empty_ei)
+            edge_index = getattr(graph, ei_key)                      # [2, E]
+            E = edge_index.size(1)
+        
+            if hasattr(graph, off_key):
+                cell_offsets_map[at] = getattr(graph, off_key)       # [E, 3]
+            else:
+                # fabricate zero-translations for all E edges
+                cell_offsets_map[at] = edge_index.new_zeros(E, 3)
+                setattr(graph, off_key, cell_offsets_map[at])        # cache
         # ────────────────────────────────────────────────────────────
 
         # 6) Message‐passing layers (with PBC‐aware geometry)
@@ -243,3 +275,14 @@ class ETNN(nn.Module):
 
     def __str__(self):
         return f"ETNN ({self.type})"
+def _infer_device(g):
+    """Return a torch.device that definitely exists in `g` (never None)."""
+    if getattr(g, 'pos', None) is not None:        # Geo datasets always have it
+        return g.pos.device
+    if getattr(g, 'batch', None) is not None:
+        return g.batch.device
+    # last resort – search for any tensor
+    for v in g.__dict__.values():
+        if torch.is_tensor(v):
+            return v.device
+    return torch.device('cpu')

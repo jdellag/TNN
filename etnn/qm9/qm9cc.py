@@ -197,6 +197,7 @@ class QM9CC(InMemoryDataset):
         # dim,
         connectivity: str,
         # merge_neighbors: str,
+        lattice: torch.Tensor = torch.eye(3),
         supercell: Optional[bool] = False,
         transform: Optional[Callable] = None,
         pre_transform: Optional[Callable] = None,
@@ -205,6 +206,7 @@ class QM9CC(InMemoryDataset):
         **lifter_kwargs,
     ) -> None:
         # Store subclass-specific attributes
+        self.lattice = lattice
         self.lifters = lifters
         self.neighbor_types = neighbor_types
         self.connectivity = connectivity
@@ -229,11 +231,10 @@ class QM9CC(InMemoryDataset):
         # self.adjacencies = adjacencies
         # self.processed_adjacencies = processed_adjacencies
         # self.merge_neighbors = merge_neighbors
-
+        self.lattice = lattice
         super().__init__(
             root, transform, pre_transform, pre_filter, force_reload=force_reload
         )
-        self.lattice = lattice
         self.load(self.processed_paths[0])
 
     def mean(self, target: int) -> float:
@@ -360,18 +361,7 @@ class QM9CC(InMemoryDataset):
             conf = mol.GetConformer()
             pos = conf.GetPositions()
             pos = torch.tensor(pos, dtype=torch.float)
-            # ——— add lattice info for periodic boundary conditions ———
-            # For a molecular crystal, you’ll pass in your 3×3 cell vectors;
-            # here we just demonstrate the API. You can replace `A` with your real cell.
-            A = torch.tensor(self.lattice, dtype=torch.float)
-            data.lattice = A                                 # [3×3] matrix of cell basis vectors
-
-            # Compute fractional coords f in [0,1)³:
-            #   f = A⁻¹·r  (mod 1)  
-            Ainv = torch.linalg.inv(A)
-            frac = (Ainv @ pos.t()).t()                      # [N×3]
-            data.frac_pos = frac.frac()                      # equivalent to frac % 1
-            # ————————————————————————————————————————————
+            
             type_idx = []
             atomic_number = []
             aromatic = []
@@ -435,8 +425,15 @@ class QM9CC(InMemoryDataset):
                 idx=i,
                 mol=mol,
             )
-
+            # add empty cell_offsets map
+            data.cell_offsets_map = {}  
             data = lift(data)
+            # ─── Inject PBC lattice & fractional coords ───
+            A = torch.tensor(self.lattice, dtype=torch.float)
+            data.lattice  = A                                  # [3×3] real cell
+            Ainv = torch.linalg.inv(A)
+            data.frac_pos = ((Ainv @ data.pos.t()).t() % 1.0)    # [N×3] in [0,1)
+             # ───────────────────────────────────────────────
 
             if self.pre_filter is not None and not self.pre_filter(data):
                 continue

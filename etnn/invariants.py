@@ -3,29 +3,31 @@ from dataclasses import dataclass
 import numba
 import numpy as np
 import torch
+from torch import Tensor
+import math
 
 from etnn import utils
 from etnn.utils import scatter_mean, scatter_max
 def compute_invariants(
-    pos: torch.Tensor,
-    frac_pos: torch.Tensor,
-    lattice: torch.Tensor,
+    pos: Tensor,
+    frac_pos: Tensor,
+    lattice: Tensor,
     cell_ind: dict[str, list[list[int]]],
-    adj: dict[str, torch.LongTensor],
+    adj: dict[str, Tensor],
     hausdorff: bool = True,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, Tensor]:
     """
     Compute PBC‐aware geometric invariants for each cell adjacency.
 
     Parameters
     ----------
-    pos : torch.Tensor [N×3]
-        Cartesian node coordinates (unused for PBC, kept for compatibility).
-    frac_pos : torch.Tensor [N×3]
+    pos : Tensor [N×3]
+        Cartesian node coordinates (unused for PBC but kept for compatibility).
+    frac_pos : Tensor [N×3]
         Fractional node coordinates in [0,1)^3.
-    lattice : torch.Tensor [3×3]
+    lattice : Tensor [3×3]
         Cell basis matrix whose columns are the primitive vectors.
-    cell_ind : dict[str → list[list[int]]]
+    cell_ind : dict[str → list of list of int]
         For each rank (e.g. "0","1",...), a list of cells, each cell given by its node‐indices.
     adj : dict[str → LongTensor of shape 2×E]
         Adjacency between cell ranks: keys like "0_1", values are two rows of sender/receiver cell indices.
@@ -38,92 +40,172 @@ def compute_invariants(
         For each adjacency rank_pair, an (E×F) tensor of invariants:
           F = 3 (centroid‐dist, sender‐diameter, receiver‐diameter) [+1 if hausdorff].
     """
+    
     device = frac_pos.device
-    # 1) Precompute centroids and diameters for each rank
-    centroids: dict[str, torch.Tensor] = {}
-    diameters: dict[str, torch.Tensor] = {}
+    print("\n===  BEGIN compute_invariants  ===")
+    print(f"[DBG-0] frac_pos.shape = {frac_pos.shape}  lattice.shape = {lattice.shape}")
+    # -------------------------------------------------------------------------
+    # 1) Pre-compute centroids & diameters per rank
+    centroids: dict[str, Tensor] = {}
+    diameters: dict[str, Tensor] = {}
 
     for rank, cells in cell_ind.items():
-        # Flatten all node‐indices for this rank
-        ids, index = [], []
-        for i, cell_nodes in enumerate(cells):
-            ids.extend(cell_nodes)
-            index.extend([i] * len(cell_nodes))
-
-        if len(ids) == 0:
-            # No cells: empty tensors
-            centroids[rank] = frac_pos.new_empty((0, 3))
-            diameters[rank] = frac_pos.new_empty((0,))
+        print(f"\n[DBG-1] Processing rank {rank}  (#cells = {len(cells)})")
+        num_cells = len(cells)
+        if num_cells == 0:
+            centroids[rank] = torch.empty((0, 3), device=device, dtype=frac_pos.dtype)
+            diameters[rank] = torch.empty((0,),  device=device, dtype=frac_pos.dtype)
             continue
 
-        ids_tensor    = torch.tensor(ids,    dtype=torch.long, device=device)
-        index_tensor  = torch.tensor(index,  dtype=torch.long, device=device)
+        # 1.1)  Flatten node ids and build map → cell
+        node_ids, cell_map = [], []
+        for ci, cell_nodes in enumerate(cells):
+            raw = cell_nodes.tolist() if isinstance(cell_nodes, torch.Tensor) else cell_nodes
+            for n in raw:
+                if isinstance(n, float) and math.isnan(n):
+                    continue
+                node_ids.append(int(n))
+                cell_map.append(ci)
+        print(f"[DBG-1a]   first 10 node_ids = {node_ids[:10]}")
+        print(f"[DBG-1b]   min/max node_id  = {min(node_ids)} / {max(node_ids)}")
 
-        # 1a) Fractional centroids → Cartesian
-        frac_cent = scatter_mean(frac_pos[ids_tensor], index_tensor, dim=0,
-                                 dim_size=len(cells))        # [num_cells×3]
-        centroids[rank] = frac_cent @ lattice.T               # [num_cells×3]
+        node_ids_t = torch.tensor(node_ids, dtype=torch.long, device=device)
+        cell_map_t = torch.tensor(cell_map, dtype=torch.long, device=device)
+        # ────────────────────────────────────────────────────────────────
+        # 1.2)  Compute centroids in Cartesian coordinates
+        #   ▸ crystals / periodic cells → lattice is [3,3]
+        #   ▸ molecules (QM9)           → lattice has an extra dim or is dummy
+        # ────────────────────────────────────────────────────────────────
+        if lattice.dim() == 2:                                  # periodic
+            frac_cent = scatter_mean(
+                frac_pos[node_ids_t],                           # fractional
+                cell_map_t,
+                dim=0,
+                dim_size=num_cells
+            )                                                   # [num_cells,3]
+            centroids[rank] = frac_cent @ lattice.T             # Cartesian
+        else:                                                   # molecular
+            centroids[rank] = scatter_mean(
+                pos[node_ids_t],                                # already Cartesian
+                cell_map_t,
+                dim=0,
+                dim_size=num_cells
+            )                                                   # [num_cells,3]
+        # ────────────────────────────────────────────────────────────────
+        print(f"[DBG-1c]   centroids[{rank}].shape = {centroids[rank].shape}")
 
-        # 1b) PBC‐aware diameters (max distance within each cell)
-        # Compute all pairwise distances within each cell
-        # We reuse the scatter_max on the flattened list of all pairs
-        pair_dists = []
-        pair_idx   = []
-        for i, cell_nodes in enumerate(cells):
-            for u in cell_nodes:
-                for v in cell_nodes:
-                    # minimum‐image in fractional space
-                    df = frac_pos[v] - frac_pos[u]
-                    df_wrap = df - torch.round(df)
-                    dc = df_wrap @ lattice.T
-                    pair_dists.append(dc.norm())
-                    pair_idx.append(i)
-        pair_dists_tensor = torch.stack(pair_dists)                       # [total_pairs]
-        pair_idx_tensor   = torch.tensor(pair_idx, dtype=torch.long,
-                                         device=device)                  # [total_pairs]
-        diameters[rank] = scatter_max(pair_dists_tensor, pair_idx_tensor,
-                                      dim=0, dim_size=len(cells))      # [num_cells]
+        # 1.3)  Diameters
+        dia_vals: list[float] = []
+        for cell_nodes in cells:
+            raw = cell_nodes.tolist() if isinstance(cell_nodes, torch.Tensor) else cell_nodes
+            nodes = [int(n) for n in raw if not (isinstance(n, float) and math.isnan(n))]
+            max_d = 0.0
+            for u in nodes:
+                for v in nodes:
+                    d = ((frac_pos[v] - frac_pos[u] - torch.round(frac_pos[v]-frac_pos[u]))
+                         @ lattice.T).norm().item()
+                    max_d = max(max_d, d)
+            dia_vals.append(max_d)
+        diameters[rank] = torch.tensor(dia_vals, dtype=frac_pos.dtype, device=device)
+        print(f"[DBG-1d]   diameters[{rank}].shape = {diameters[rank].shape}")
 
-    # 2) Build per‐adjacency features
-    features: Dict[str, torch.Tensor] = {}
+    # -------------------------------------------------------------------------
+    # 2)  Build per-adjacency feature tensors
+    features: dict[str, Tensor] = {}
+
     for rank_pair, cell_pairs in adj.items():
-        send_rank, recv_rank = rank_pair.split("_")
-        send_idx = cell_pairs[0]  # shape [E]
-        recv_idx = cell_pairs[1]  # shape [E]
+        print(f"\n[DBG-2]  Processing adjacency '{rank_pair}'")
+        parts = rank_pair.split("_")
+        send_rank, recv_rank = parts[0], parts[1]
 
-        # 2a) Centroid–centroid distance
-        cs = centroids[send_rank][send_idx]  # [E×3]
-        cr = centroids[recv_rank][recv_idx]  # [E×3]
-        centroid_dist = torch.norm(cs - cr, dim=1)  # [E]
+        # 2.1)  Raw → LongTensor indices
+        s_raw, r_raw = cell_pairs
+        send_idx = torch.as_tensor(s_raw, dtype=torch.long, device=device).flatten()
+        recv_idx = torch.as_tensor(r_raw, dtype=torch.long, device=device).flatten()
+        print(f"[DBG-2a]     raw send/rev shapes = {send_idx.shape} / {recv_idx.shape}")
 
-        # 2b) Sender/receiver diameters
-        d_send = diameters[send_rank][send_idx]    # [E]
-        d_recv = diameters[recv_rank][recv_idx]    # [E]
+        # 2.2)  Mask out-of-range
+        max_send = centroids[send_rank].size(0)
+        max_recv = centroids[recv_rank].size(0)
+        valid = (send_idx < max_send) & (recv_idx < max_recv)
+        print(f"[DBG-2b]     #valid edges = {valid.sum().item()}  "
+              f"(before mask: {send_idx.numel()})")
+        if valid.sum() == 0:
+            print(f"[DBG-2b]     SKIP '{rank_pair}' – no valid edges")
+            continue
+        send_idx, recv_idx = send_idx[valid], recv_idx[valid]
 
-        # 2c) Stack into [E×3]
+        # 2.3)  Ensure 1-to-1 pairing
+        if send_idx.numel() != recv_idx.numel():
+            print(f"[DBG-2c]     unequal lengths – making meshgrid product")
+            s, r = torch.meshgrid(send_idx, recv_idx, indexing="ij")
+            send_idx, recv_idx = s.reshape(-1), r.reshape(-1)
+        print(f"[DBG-2c]     paired send/rev shapes = {send_idx.shape} / {recv_idx.shape}")
+
+        # 2.4)  Gather per-edge quantities
+        c_send = centroids[send_rank][send_idx]
+        c_recv = centroids[recv_rank][recv_idx]
+        centroid_dist = torch.norm(c_send - c_recv, dim=1)
+
+        d_send = diameters[send_rank][send_idx]
+        d_recv = diameters[recv_rank][recv_idx]
+
+        print(f"[DBG-2d]     centroid_dist.shape = {centroid_dist.shape}")
+        print(f"[DBG-2d]     d_send.shape         = {d_send.shape}")
+        print(f"[DBG-2d]     d_recv.shape         = {d_recv.shape}")
+
+        assert centroid_dist.shape == d_send.shape == d_recv.shape, \
+            f"{rank_pair}: mismatch {centroid_dist.shape} vs {d_send.shape} vs {d_recv.shape}"
+
         feats = torch.stack([centroid_dist, d_send, d_recv], dim=1)
+        print(f"[DBG-2e]     feats.shape (3-col) = {feats.shape}")
 
-        # 2d) Optional Hausdorff distance under PBC
+        # 2.5)  Optional Hausdorff
         if hausdorff:
-            from etnn.invariants import compute_hausdorff_distances
-            # For each pair of cells, compute max_{u in S, v in R} ||u-v|| under PBC
-            haus_vals = []
+            haus_s_to_r = []
+            haus_r_to_s = []
             for u_idx, v_idx in zip(send_idx.tolist(), recv_idx.tolist()):
-                S = cell_ind[send_rank][u_idx]
-                R = cell_ind[recv_rank][v_idx]
-                max_dist = 0.0
-                for u in S:
-                    for v in R:
+                # grab node lists for the two cells (already int-lists, no NaNs)
+                S_nodes = cell_ind[send_rank][u_idx]
+                R_nodes = cell_ind[recv_rank][v_idx]
+
+                # (1) sender → receiver
+                dists_sr = []
+                for u in S_nodes:
+                    # find min distance to any v in R
+                    dists = []
+                    for v in R_nodes:
                         df = frac_pos[v] - frac_pos[u]
-                        df_wrap = df - torch.round(df)
-                        dc = df_wrap @ lattice.T
-                        max_dist = max(max_dist, dc.norm().item())
-                haus_vals.append(max_dist)
-            haus_tensor = torch.tensor(haus_vals, device=device).unsqueeze(1)  # [E×1]
-            feats = torch.cat([feats, haus_tensor], dim=1)                    # [E×4]
+                        dc = (df - torch.round(df)) @ lattice.T
+                        dists.append(dc.norm().item())
+                    dists_sr.append(max(dists))      # sender’s worst case
+                haus_s_to_r.append(max(dists_sr))     # Hausdorff S→R
 
+                # (2) receiver → sender
+                dists_rs = []
+                for v in R_nodes:
+                    dists = []
+                    for u in S_nodes:
+                        df = frac_pos[u] - frac_pos[v]
+                        dc = (df - torch.round(df)) @ lattice.T
+                        dists.append(dc.norm().item())
+                    dists_rs.append(max(dists))      # receiver’s worst case
+                haus_r_to_s.append(max(dists_rs))     # Hausdorff R→S
+
+            h1 = torch.tensor(haus_s_to_r, dtype=frac_pos.dtype, device=device)
+            h2 = torch.tensor(haus_r_to_s, dtype=frac_pos.dtype, device=device)
+            feats = torch.stack([centroid_dist, d_send, d_recv, h1, h2], dim=1)
+        else:
+            feats = torch.stack([centroid_dist, d_send, d_recv], dim=1)
+
+            print(f"[DBG-2f]     feats.shape (+Haus) = {feats.shape}")
+
+        # 2.6)  Save
         features[rank_pair] = feats
+        print(f"[DBG-2g]     stored features['{rank_pair}'].shape = {feats.shape}")
 
+    # -------------------------------------------------------------------------
+    print("===  END compute_invariants  ===\n")
     return features
 
 # compute_invariants.num_features_map = defaultdict(lambda: 5)  # not needed, better to compute dynamic
@@ -473,31 +555,38 @@ def compute_invariants_sparse(
 
     # compute distances
     for rank_pair, cell_pairs in adj.items():
-        send_rank, recv_rank = rank_pair.split("_")
+        # rank_pair can be "i_j" or "i_j_via"
+        parts = rank_pair.split("_")
+        send_rank, recv_rank = parts[0], parts[1]
 
-        # check if reverse message has been computed
-        flipped_rank_pair = f"{recv_rank}_{send_rank}"
-        if flipped_rank_pair in inv_list:
-            inv_list[rank_pair] = inv_list[flipped_rank_pair]
-            continue
+        # --------------------------------------------------------------------
+        # 1) Always work with LongTensor indices
+        s_raw, r_raw = cell_pairs          # two 1-D tensors *or* Python lists
+        send_idx = torch.as_tensor(s_raw, dtype=torch.long,
+                                   device=dev) if not torch.is_tensor(s_raw) else s_raw.to(torch.long)
+        recv_idx = torch.as_tensor(r_raw, dtype=torch.long,
+                                   device=dev) if not torch.is_tensor(r_raw) else r_raw.to(torch.long)
 
-        # centroid dist
-        # PBC‐aware centroid distance
-        c_send = centroids[send_rank][cell_pairs[0]]
-        c_recv = centroids[recv_rank][cell_pairs[1]]
-        # but centroids were already Cartesian‐mapped, so simple norm
-        centroids_dist = torch.norm(c_send - c_recv, dim=1)
+        # 2) Drop any edges that point past the end of the cell list for this rank
+        max_send = centroids[send_rank].size(0)
+        max_recv = centroids[recv_rank].size(0)
+        valid = (send_idx < max_send) & (recv_idx < max_recv)
+        if valid.sum().item() == 0:
+            continue                      # nothing valid for this adjacency
 
-        # diameter
-        diameter_send = diameters[send_rank][cell_pairs[0]]
-        diameter_recv = diameters[recv_rank][cell_pairs[1]]
+        send_idx = send_idx[valid]
+        recv_idx = recv_idx[valid]
+        # --------------------------------------------------------------------
 
-        inv_list[rank_pair] = [
-            centroids_dist,
-            diameter_send,
-            diameter_recv,
-        ]
+        # (the remainder of the loop is unchanged)
+        c_send = centroids[send_rank][send_idx]
+        c_recv = centroids[recv_rank][recv_idx]
+        centroid_dist  = torch.norm(c_send - c_recv, dim=1)
 
+        d_send = diameters[send_rank][send_idx]
+        d_recv = diameters[recv_rank][recv_idx]
+
+        inv_list[rank_pair] = [centroid_dist, d_send, d_recv]
         # hausdorff
         if hausdorff:
             # gather indices for positions
