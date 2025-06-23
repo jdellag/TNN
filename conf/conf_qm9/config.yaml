@@ -36,7 +36,7 @@ model:
   # merge_neighbors: false
 
 training:
-  epochs: 350
+  epochs: 40
   batch_size: 96
   weight_decay: 1e-16
   min_lr: 0.0

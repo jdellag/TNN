@@ -142,7 +142,6 @@ def main(cfg: DictConfig):
             loss = crit(pred, (batch.y - mean) / mad)
             mae = crit(pred * mad + mean, batch.y)
             loss.backward()
-
             if cfg.training.clip_gradients:
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(), cfg.training.clip_amount
@@ -181,7 +180,7 @@ def main(cfg: DictConfig):
 
         epoch_end_time = time.time()
         epoch_duration = epoch_end_time - epoch_start_time
-
+        print(f"**************** Finished Epoch {epoch:03d} | Avg Train MAE: {epoch_mae_train:.6f} | Val MAE: {epoch_mae_val:.6f}**************** ", flush=True)
         wandb.log(
             {
                 "Train MAE": epoch_mae_train,
